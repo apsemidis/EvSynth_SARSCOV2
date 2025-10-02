@@ -1,0 +1,558 @@
+
+############################
+#----- COVID modeling -----#
+############################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Run Stan
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# Perform bridgesampling
+library(bridgesampling)
+
+# Estimate WAIC
+library(loo)
+
+# Nice plots
+library(ggplot2)
+library(bayesplot)
+
+
+## Functions ##
+
+
+# Function to convert cumulative to daily data
+# 
+# x         : cumulative vector to be converted
+# problems  : if TRUE, it returns successive values around a problem
+# 
+cum.to.daily <- function(x, problems = FALSE){
+  
+  # Convert NA's to 0
+  Xnew <- x
+  if(is.na(Xnew[1])){
+    Xnew[1] <- 0
+  }
+  for(i in 2:length(Xnew)){
+    if(is.na(Xnew[i]) & Xnew[i-1] == 0){
+      Xnew[i] <- 0
+    } else if(is.na(Xnew[i]) & Xnew[i-1] != 0){
+      Xnew[i] <- Xnew[i-1]
+    }
+  }
+  
+  # Convert cumulative to daily
+  daily <- numeric(length(Xnew))
+  daily[1] <- Xnew[1]
+  for(i in 2:length(daily)){
+    daily[i] <- Xnew[i] - Xnew[i-1]
+  }
+  
+  neg.values.ind <- which(daily < 0)
+  if(length(neg.values.ind) > 0){
+    message("Warning! Some daily numbers are negative:")
+    print(neg.values.ind)
+  }
+  
+  if(problems == TRUE){
+    res <- NULL
+    for(i in 1:length(neg.values.ind)){
+      neg.vals <- Xnew[(max(1, neg.values.ind[i]-4)):(min(neg.values.ind[i]+4, length(Xnew)))]
+      res <- rbind(res, neg.vals)
+    }
+    
+    return(list(Daily_numbers = daily, Problems_at = neg.values.ind, Problematic_values = res))
+  } else
+    
+    return(daily)
+}
+
+# Functions to create symmetric 50% (q1...q2) and 95% (q3...q4) CrI
+# 
+# x : vector of samples to compute the quantile
+# 
+q1 <- function(x){
+  quantile(x, 0.25)
+}
+q2 <- function(x){
+  quantile(x, 0.75)
+}
+q3 <- function(x){
+  quantile(x, 0.025)
+}
+q4 <- function(x){
+  quantile(x, 0.975)
+}
+
+
+#####
+# Load the data
+
+
+## Cases, deaths ##
+
+
+# Load the data
+dat_confirmed <- read.csv("confirmed.txt", sep = ",", header = TRUE)
+dat_deaths <- read.csv("deaths.txt", sep = ",", header = TRUE)
+dat_con_gr <- dat_confirmed[dat_confirmed$Country.Region == "Greece", ]
+dat_dea_gr <- dat_deaths[dat_deaths$Country.Region == "Greece", ]
+greece_data <- data.frame(date = colnames(dat_con_gr[, -c(1:4)]),
+                          confirmed = c(as.matrix(dat_con_gr[, -c(1:4)])),
+                          deaths = c(as.matrix(dat_dea_gr[, -c(1:4)])))
+greece_data$date <- strptime(as.character(greece_data$date), "X%m.%d.%y")
+
+# Add to the final set
+greece_ts <- data.frame(date = greece_data$date,
+                        new_cases = rep(NA, nrow(greece_data)),
+                        new_deaths = rep(NA, nrow(greece_data)))
+greece_ts$new_cases <- cum.to.daily(greece_data$confirmed)
+greece_ts$new_deaths <- cum.to.daily(greece_data$deaths)
+res.times_gr <- which.max(greece_data$confirmed > 0) # when the epidemic begins
+greece_ts <- greece_ts[res.times_gr:nrow(greece_ts), ]
+rownames(greece_ts) <- 1:nrow(greece_ts)
+
+
+## Vaccinations ##
+
+
+vacc.dat <- read.csv("vaccinations_gr.txt")
+daily.vacc <- cum.to.daily(vacc.dat$people_vaccinated)
+vacc_gr <- data.frame(date = strptime(vacc.dat$date, "%Y-%m-%d"), daily.vacc)
+
+
+#####
+# Match the data
+
+
+# From - To for every set
+c(greece_ts$date[1], greece_ts$date[nrow(greece_ts)])
+c(vacc_gr$date[1], vacc_gr$date[nrow(vacc_gr)])
+
+# Add the vaccinations
+vacc.new <- vacc_gr$daily.vacc[1:which(vacc_gr$date == greece_ts$date[nrow(greece_ts)])]
+greece_ts$new_vacc <- c(rep(0, nrow(greece_ts) - length(vacc.new)),
+                        vacc.new)
+
+greece_ts <- greece_ts[1:which(greece_ts$date == "2021-12-31"), ]
+
+
+#####
+# Complete dataset
+
+
+rbind(head(greece_ts), tail(greece_ts))
+str(greece_ts)
+
+
+#####
+# Stan Models
+
+
+# SEIR; vacc; dem
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  int e_per;                         // length of exposed period
+  vector[N] vacc;                    // daily vaccinations (1st doses)
+  real A;                            // daily births ( = daily deaths)
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2-e_per] lambda;    // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2-e_per] S;         // susceptible
+  vector<lower=0>[N-2-e_per] I;         // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:(tau+e_per)){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I_t = 0;
+    for(k in 1:t){
+      I_t += tot_cases[k];
+    }
+    I[t] = I_t - A*I[t-1]/pop;
+    S[t] = S[t-1] - tot_cases[t] - vacc[t] + A - A*S[t-1]/pop;
+  }
+  for(t in 2:(tau+e_per)){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+e_per+1):(N-1)){
+    I_t = 0;
+    for(k in (t-e_per-tau):(t-e_per-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1-e_per] = I_t - A*I[t-2-e_per]/pop;
+    S[t-1-e_per] = S[t-2-e_per] - tot_cases[t-1-e_per] - vacc[t-1-e_per] + A - A*S[t-2-e_per]/pop;
+    tot_cases[t] = lambda[t-1-e_per] * S[t-1-e_per] * I[t-1-e_per] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+neg_bin_mod1 <- stan_model(model_code = NegBin_1)
+
+
+#####
+# SEIR; vacc; dem
+
+
+# The stan data
+seq_u <- c(1, seq(1+4*7, nrow(greece_ts), by = 2*7))
+stan_data <- within(list(), {
+  N <- nrow(greece_ts)
+  pop <- 10816286
+  deaths <- greece_ts$new_deaths
+  ch_p <- array(c(which(greece_ts$date == "2020-08-01"),
+                  which(greece_ts$date == "2020-11-03"),
+                  which(greece_ts$date == "2021-02-06"),
+                  which(greece_ts$date == "2021-05-07"),
+                  which(greece_ts$date == "2021-09-10")),
+                dim = 5)
+  breaks <- c(2, ch_p, nrow(greece_ts))
+  br <- length(breaks)
+  ifr_m <- c(0.0115, 0.008, 0.0115, 0.0113, 0.0069, 0.0075)
+  tau <- 6
+  e_per <- 2
+  u <- c(seq_u[-c(length(seq_u), length(seq_u)-1)], nrow(greece_ts) - 1 - e_per)
+  l_n <- length(u)
+  A <- round((1049839 / 10) / 365, 2)})
+
+set.seed(42850)
+
+# Infection-to-onset (incubation)
+mu <- 5.1
+sigma <- 5.1 * 0.86
+sigma2 <- sigma^2
+alpha <- mu^2 / sigma2
+beta <- mu / sigma2
+g1 <- rgamma(1e7, shape = alpha, rate = beta)
+
+# Onset-to-death
+mu <- 18.8
+sigma <- 18.8 * 0.45
+sigma2 <- sigma^2
+alpha <- mu^2 / sigma2
+beta <- mu / sigma2
+g2 <- rgamma(1e7, shape = alpha, rate = beta)
+
+# Infection-to-death
+g <- g1 + g2
+ECDF <- ecdf(g)
+p <- NULL
+p[1] <- ECDF(1.5) - ECDF(0)
+for(s in 2:(stan_data$N-1)){
+  p[s] = ECDF(s+0.5) - ECDF(s-0.5)
+}
+stan_data$p_d <- p
+
+# Vaccinations
+stan_data$vacc <- numeric(stan_data$N)
+for(i in 15:35){
+  stan_data$vacc[i] <- 0.4*greece_ts$new_vacc[i-14]
+}
+for(i in 36:stan_data$N){
+  stan_data$vacc[i] <- 0.4*greece_ts$new_vacc[i-14] + 0.1*greece_ts$new_vacc[i-35]
+}
+
+# Stan parameters
+n_chains <- 3
+n_warmups <- 4e3
+n_iter <- 2e3 + n_warmups
+ad.delta <- 0.98
+m.tree <- 14
+n_thin <- 1
+
+# Set initial values
+iniv <- function(){
+  list(lambdas = rep(0.2, stan_data$l_n-1),
+       psi = 10,
+       ifrs = stan_data$ifr_m,
+       tot_cases1 = 50,
+       theta_d1 = 1)
+}
+
+# Run NUTS
+time.start_nuts_1.1 <- Sys.time()
+nuts_fit_1.1 <- sampling(neg_bin_mod1,
+                         data = stan_data,
+                         iter = n_iter,
+                         init = iniv,
+                         chains = n_chains,
+                         warmup = n_warmups,
+                         thin = n_thin,
+                         seed = 5678,
+                         control = list(adapt_delta = ad.delta,
+                                        max_treedepth = m.tree))
+time.end_nuts_1.1 <- Sys.time()
+duration_nuts_1.1 <- time.end_nuts_1.1 - time.start_nuts_1.1
+
+nuts_summary_1.1 <- summary(nuts_fit_1.1, pars = c("theta_d1", "tot_cases1", "psi", "ifrs"))$summary
+print(nuts_summary_1.1, digits = 2)
+
+# Divergent transitions, exceeded treedepth
+check_divergences(nuts_fit_1.1)
+check_treedepth(nuts_fit_1.1)
+
+# Extract posterior samples
+posts_1.1 <- rstan::extract(nuts_fit_1.1)
+
+# Marginal likelihood using bridge sampling
+bridge_1.1 <- bridge_sampler(nuts_fit_1.1, method = "warp3", repetitions = 50, silent = TRUE)
+summary(bridge_1.1)
+
+# Dispersion parameter
+median(posts_1.1$psi) # 42.07497
+c(q3(posts_1.1$psi), q4(posts_1.1$psi)) # (31.89019, 56.17414)
+
+
+## Visualize results ##
+
+
+# Rt estimates
+R.q1 <- apply(posts_1.1$lambda * stan_data$tau * posts_1.1$S / stan_data$pop, 2, q1)
+R.q2 <- apply(posts_1.1$lambda * stan_data$tau * posts_1.1$S / stan_data$pop, 2, q2)
+R.q3 <- apply(posts_1.1$lambda * stan_data$tau * posts_1.1$S / stan_data$pop, 2, q3)
+R.q4 <- apply(posts_1.1$lambda * stan_data$tau * posts_1.1$S / stan_data$pop, 2, q4)
+R.med <- apply(posts_1.1$lambda * stan_data$tau * posts_1.1$S / stan_data$pop, 2, median)
+ggdt <- data.frame(x = 1:(nrow(greece_ts)-2-stan_data$e_per),
+                   y = R.med,
+                   low = c(R.q1, R.q3),
+                   high = c(R.q2, R.q4),
+                   g = factor(rep(c("0.5", "0.95"), each = nrow(greece_ts)-2-stan_data$e_per)))
+ggplot(data = ggdt, aes(x = x, y = y)) +
+  geom_hline(yintercept = 1, linetype = "dashed") +
+  geom_line() +
+  geom_ribbon(data = ggdt[ggdt$g == "0.5", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  geom_ribbon(data = ggdt[ggdt$g == "0.95", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  theme_bw() +
+  labs(x = NULL,
+       y = NULL,
+       title = expression(R[t] - Greece)) +
+  scale_x_continuous(breaks = seq(1, nrow(greece_ts), by = 30),
+                     labels = seq(greece_ts$date[1], greece_ts$date[length(greece_ts$date)],
+                                  by = 60*60*24*30)) +
+  scale_y_continuous(breaks = seq(0, 7, by = 0.5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "gray14"),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 14, angle = 70, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", size = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("Rt_gr_1.1.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# New deaths per day
+theta.q1 <- apply(posts_1.1$theta_d, 2, q1)
+theta.q2 <- apply(posts_1.1$theta_d, 2, q2)
+theta.q3 <- apply(posts_1.1$theta_d, 2, q3)
+theta.q4 <- apply(posts_1.1$theta_d, 2, q4)
+theta.med <- apply(posts_1.1$theta_d, 2, median)
+ggdt <- data.frame(x = 1:nrow(greece_ts),
+                   y = stan_data$deaths,
+                   med = theta.med,
+                   low = c(theta.q1, theta.q3),
+                   high = c(theta.q2, theta.q4),
+                   g = factor(rep(c("0.5", "0.95"), each = nrow(greece_ts))))
+ggplot(data = ggdt, aes(x = x, y = y)) +
+  geom_point() +
+  geom_line() +
+  geom_line(aes(x = x, y = med)) +
+  geom_ribbon(data = ggdt[ggdt$g == "0.5", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  geom_ribbon(data = ggdt[ggdt$g == "0.95", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  theme_bw() +
+  labs(x = NULL,
+       y = NULL,
+       title = "Fitted Deaths - Greece") +
+  scale_x_continuous(breaks = seq(1, nrow(greece_ts), by = 30),
+                     labels = seq(greece_ts$date[1], greece_ts$date[length(greece_ts$date)], by = 60*60*24*30)) +
+  scale_y_continuous(breaks = seq(0, 140, by = 20)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "gray14"),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 14, angle = 70, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", size = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("thetad_gr_1.1.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Total cases per day
+totc.q1 <- apply(posts_1.1$tot_cases, 2, q1)
+totc.q2 <- apply(posts_1.1$tot_cases, 2, q2)
+totc.q3 <- apply(posts_1.1$tot_cases, 2, q3)
+totc.q4 <- apply(posts_1.1$tot_cases, 2, q4)
+totc.med <- apply(posts_1.1$tot_cases, 2, median)
+ggdt <- data.frame(x = 1:(nrow(greece_ts)-1),
+                   y = greece_ts$new_cases[-nrow(greece_ts)],
+                   med = totc.med,
+                   low = c(totc.q1, totc.q3),
+                   high = c(totc.q2, totc.q4),
+                   g = factor(rep(c("0.5", "0.95"), each = nrow(greece_ts)-1)))
+ggplot(data = ggdt, aes(x = x, y = y)) +
+  geom_point() +
+  geom_line() +
+  geom_line(aes(x = x, y = med)) +
+  geom_ribbon(data = ggdt[ggdt$g == "0.5", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  geom_ribbon(data = ggdt[ggdt$g == "0.95", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  theme_bw() +
+  labs(x = NULL,
+       y = NULL,
+       title = "Total Cases - Greece") +
+  scale_x_continuous(breaks = seq(1, nrow(greece_ts), by = 30),
+                     labels = seq(greece_ts$date[1], greece_ts$date[length(greece_ts$date)], by = 60*60*24*30)) +
+  scale_y_continuous(breaks = seq(0, 50e3, by = 5e3)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "gray14"),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 14, angle = 70, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", size = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("totc_gr_1.1.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Cumulative total cases
+cum.c.q1 <- cumsum(apply(posts_1.1$tot_cases, 2, q1))
+cum.c.q2 <- cumsum(apply(posts_1.1$tot_cases, 2, q2))
+cum.c.q3 <- cumsum(apply(posts_1.1$tot_cases, 2, q3))
+cum.c.q4 <- cumsum(apply(posts_1.1$tot_cases, 2, q4))
+cum.c.med <- cumsum(apply(posts_1.1$tot_cases, 2, median))
+ggdt <- data.frame(x = 1:(nrow(greece_ts)-1),
+                   y = cumsum(greece_ts$new_cases[-nrow(greece_ts)]),
+                   med = cum.c.med,
+                   low = c(cum.c.q1, cum.c.q3),
+                   high = c(cum.c.q2, cum.c.q4),
+                   g = factor(rep(c("0.5", "0.95"), each = nrow(greece_ts)-1)))
+ggplot(data = ggdt, aes(x = x, y = y)) +
+  geom_point() +
+  geom_line(aes(x = x, y = med)) +
+  geom_ribbon(data = ggdt[ggdt$g == "0.5", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  geom_ribbon(data = ggdt[ggdt$g == "0.95", ], aes(ymin = low, ymax = high), fill = "steelblue", alpha = 0.5) +
+  theme_bw() +
+  labs(x = NULL,
+       y = NULL,
+       title = "Cumulative Total Cases - Greece") +
+  scale_x_continuous(breaks = seq(1, (nrow(greece_ts)-1), by = 30),
+                     labels = seq(greece_ts$date[1], greece_ts$date[length(greece_ts$date)-1], by = 60*60*24*30)) +
+  scale_y_continuous(breaks = seq(0, 3.5e7, by = 5e5)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "gray14"),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 14, angle = 70, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", size = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("cumcases_gr_1.1.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+# Proportion observed
+propc.q1 <- greece_ts$new_cases[-nrow(greece_ts)] / apply(posts_1.1$tot_cases, 2, q1)
+propc.q2 <- greece_ts$new_cases[-nrow(greece_ts)] / apply(posts_1.1$tot_cases, 2, q2)
+propc.q3 <- greece_ts$new_cases[-nrow(greece_ts)] / apply(posts_1.1$tot_cases, 2, q3)
+propc.q4 <- greece_ts$new_cases[-nrow(greece_ts)] / apply(posts_1.1$tot_cases, 2, q4)
+propc.med <- greece_ts$new_cases[-nrow(greece_ts)] / apply(posts_1.1$tot_cases, 2, median)
+ggdt <- data.frame(x = 1:(nrow(greece_ts)-1),
+                   med = propc.med,
+                   low = c(propc.q1, propc.q3),
+                   high = c(propc.q2, propc.q4),
+                   g = factor(rep(c("0.5", "0.95"), each = nrow(greece_ts)-1)))
+ggplot(data = ggdt, aes(x = x, y = med)) +
+  geom_smooth(method = "loess", se = TRUE, span = 0.5) +
+  theme_bw() +
+  labs(x = NULL,
+       y = NULL,
+       title = "Proportion observed - Greece") +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_x_continuous(breaks = seq(1, nrow(greece_ts), by = 30),
+                     labels = seq(greece_ts$date[1], greece_ts$date[length(greece_ts$date)], by = 60*60*24*30)) +
+  theme(plot.title = element_text(size = 20, face = "bold", hjust = 0.5, color = "gray14"),
+        axis.title = element_text(size = 14),
+        axis.text.x = element_text(size = 14, angle = 70, hjust = 1),
+        axis.text.y = element_text(size = 12),
+        panel.border = element_blank(),
+        axis.line = element_line(colour = "black", size = 0.7, linetype = "solid"),
+        panel.grid.minor = element_blank())
+# ggsave("prop3_gr_1.1.png", device = "png", width = 7, height = 5, units = "in", dpi = 600)
+
+

@@ -1,0 +1,426 @@
+
+###############################
+#----- lambda prediction -----#
+###############################
+
+
+#####
+# Libraries and functions
+
+
+## Libraries ##
+
+
+# Run Stan
+library(rstan)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+
+# GAM and XGBoost
+library(mgcv)
+library(xgboost)
+
+# Nice plots
+library(ggplot2)
+
+
+## Functions ##
+
+
+# Function to convert cumulative to daily data
+# 
+# x         : cumulative vector to be converted
+# problems  : if TRUE, it returns successive values around a problem
+# 
+cum.to.daily <- function(x, problems = FALSE){
+  
+  # Convert NA's to 0
+  Xnew <- x
+  if(is.na(Xnew[1])){
+    Xnew[1] <- 0
+  }
+  for(i in 2:length(Xnew)){
+    if(is.na(Xnew[i]) & Xnew[i-1] == 0){
+      Xnew[i] <- 0
+    } else if(is.na(Xnew[i]) & Xnew[i-1] != 0){
+      Xnew[i] <- Xnew[i-1]
+    }
+  }
+  
+  # Convert cumulative to daily
+  daily <- numeric(length(Xnew))
+  daily[1] <- Xnew[1]
+  for(i in 2:length(daily)){
+    daily[i] <- Xnew[i] - Xnew[i-1]
+  }
+  
+  neg.values.ind <- which(daily < 0)
+  if(length(neg.values.ind) > 0){
+    message("Warning! Some daily numbers are negative:")
+    print(neg.values.ind)
+  }
+  
+  if(problems == TRUE){
+    res <- NULL
+    for(i in 1:length(neg.values.ind)){
+      neg.vals <- Xnew[(max(1, neg.values.ind[i]-4)):(min(neg.values.ind[i]+4, length(Xnew)))]
+      res <- rbind(res, neg.vals)
+    }
+    
+    return(list(Daily_numbers = daily, Problems_at = neg.values.ind, Problematic_values = res))
+  } else
+    
+    return(daily)
+}
+
+# Function for k-fold r-repeated cross validation
+# 
+# user.data     : data in a data.frame(x,y), where x = predictor and y = response
+#                 (if var_sel=TRUE, then x = predictors from which to choose)
+# mod.type      : model type (linreg, gam, xgboost)
+# k             : number of folds in k-fold CV
+# r             : number of times to repeat CV
+# seed          : seed number for reproducibility
+# xgb.rounds    : initial rounds for XGBoost
+# xgb.maxdepth  : maximum depth for XGBoost
+# var_sel       : TRUE if variable selection is needed
+# Y             : response variable if var_sel = TRUE
+# X             : covariates if var_sel = TRUE
+# 
+repcv <- function(user.data, mod.type = "linreg", k = 10, r = 5, seed = 123,
+                  xgb.rounds = 1.5e2, xgb.maxdepth = 1, var_sel = FALSE, Y = NULL, X = NULL){
+  
+  set.seed(seed)
+  
+  # Initialize
+  RMSE <- MAE <- list()
+  rcv <- array(dim = c(k, 2, r),
+               dimnames = list(paste("Fold No.", 1:k),
+                               c("RMSE", "MAE"),
+                               paste("Repetition No.", 1:r)))
+  best.rounds <- NULL
+  
+  # Repeat r times
+  for(j in 1:r){
+    
+    test.inds <- matrix(nrow = k, ncol = round(nrow(user.data)/k))
+    res.ind <- NULL
+    
+    for(i in 1:k){
+      if(i == 1){
+        test.inds[i, ] <- sample(seq_len(nrow(user.data)), size = round(nrow(user.data)/k), replace = FALSE)
+      } else {
+        test.inds[i, ] <- sample(seq_len(nrow(user.data))[-c(res.ind)], size = round(nrow(user.data)/k), replace = FALSE)
+      }
+      if(var_sel == TRUE){
+        R2 <- list(R2_covs = NULL, R2_resp = NULL)
+        for(s in 1:ncol(X)){
+          R2$R2_covs[s] <- summary(lm(X[-test.inds[i, ], s] ~ X[-test.inds[i, ], -s]))$r.squared
+          R2$R2_resp[s] <- summary(lm(Y[-test.inds[i, ]] ~ X[-test.inds[i, ], s]))$r.squared
+        }
+        X.new <- X[, which.max(R2$R2_covs + R2$R2_resp)]
+        user.data <- data.frame(x = X.new, y = Y)
+      }
+      if(mod.type == "linreg"){
+        fit <- lm(y ~ x, data = user.data[-test.inds[i, ], ])
+      } else
+        if(mod.type == "gam"){
+          fit <- gam(y ~ s(x, bs = "tp"), data = user.data[-test.inds[i, ], ])
+        } else
+          if(mod.type == "xgboost"){
+            
+            train_x <- data.matrix(user.data[-test.inds[i, ], 1])
+            train_y <- user.data[-test.inds[i, ], 2]
+            
+            test_x <- data.matrix(user.data[test.inds[i, ], 1])
+            test_y <- user.data[test.inds[i, ], 2]
+            
+            xgb_train <- xgb.DMatrix(data = train_x, label = train_y)
+            xgb_test <- xgb.DMatrix(data = test_x, label = test_y)
+            
+            # Run xgb.rounds iterations
+            fit <- xgb.train(data = xgb_train, max.depth = xgb.maxdepth, nrounds = xgb.rounds,
+                             watchlist = list(train = xgb_train, test = xgb_test),
+                             verbose = 0)
+            
+            # Run until the best test rmse found
+            fit <- xgb.train(data = xgb_train, max.depth = xgb.maxdepth, nrounds = which.min(fit$evaluation_log$test_rmse),
+                             watchlist = list(train = xgb_train, test = xgb_test),
+                             verbose = 0)
+            
+            best.rounds <- c(best.rounds, which.min(fit$evaluation_log$test_rmse))
+            
+            preds <- predict(fit, xgb_test)
+          }
+      
+      if(mod.type != "xgboost"){
+        preds <- predict(fit, newdata = data.frame(x = user.data[test.inds[i, ], 1]))
+      }
+      RMSE[[i]] <- sqrt(mean((user.data[test.inds[i, ], 2] - preds)^2))
+      MAE[[i]] <- mean(abs(user.data[test.inds[i, ], 2] - preds))
+      rcv[i, , j] <- c(RMSE[[i]], MAE[[i]])
+      res.ind <- c(res.ind, test.inds[i, ])
+    }
+  }
+  
+  RMSE <- rcv[, 1, ]
+  MAE <- rcv[, 2, ]
+  rmse.fin <- apply(RMSE, 2, mean)
+  rmse.tot <- mean(rmse.fin)
+  mae.fin <- apply(MAE, 2, mean)
+  mae.tot <- mean(mae.fin)
+  
+  if(mod.type == "xgboost"){
+    rounds.fin <- mean(best.rounds)
+    return(list(rmse = list(RMSE = rmse.tot, RMSE_at_every_rep = rmse.fin),
+                mae = list(MAE = mae.tot, MAE_at_every_rep = mae.fin),
+                rounds = list(ROUNDS = rounds.fin, ROUNDS_at_every_Step = best.rounds)))
+  } else
+    return(list(rmse = list(RMSE = rmse.tot, RMSE_at_every_rep = rmse.fin),
+                mae = list(MAE = mae.tot, MAE_at_every_rep = mae.fin)))
+}
+
+
+#####
+# Load the data
+
+
+# Google data
+google.dat_gr <- read.csv("mobility_google.csv") # read the data you have downloaded
+google.dat_gr$date <- as.POSIXlt(google.dat_gr$date)
+names(google.dat_gr) <- c("date", "rere", "gropha", "par", "trast", "work", "resid")
+
+# Apple data
+apple.dat_gr <- read.csv("mobility_apple.csv") # read the data you have downloaded
+
+# Match Apple with Google data
+apple.new <- apple.dat_gr[-c(1:(which(apple.dat_gr$date == google.dat_gr$date[1])-1)), ]
+google.new <- google.dat_gr[-c((which(google.dat_gr$date == apple.dat_gr$date[nrow(apple.dat_gr)])+1):nrow(google.dat_gr)), ]
+data.mob <- cbind(google.new, apple.new[, -1])
+rownames(data.mob) <- 1:nrow(data.mob)
+
+# Cases, deaths
+dat_confirmed <- read.csv("confirmed.txt", sep = ",", header = TRUE)
+dat_deaths <- read.csv("deaths.txt", sep = ",", header = TRUE)
+dat_con_gr <- dat_confirmed[dat_confirmed$Country.Region == "Greece", ]
+dat_dea_gr <- dat_deaths[dat_deaths$Country.Region == "Greece", ]
+greece_data <- data.frame(date = colnames(dat_con_gr[, -c(1:4)]),
+                          confirmed = c(as.matrix(dat_con_gr[, -c(1:4)])),
+                          deaths = c(as.matrix(dat_dea_gr[, -c(1:4)])))
+greece_data$date <- strptime(as.character(greece_data$date), "X%m.%d.%y")
+
+# Add to the final set
+greece_ts <- data.frame(date = greece_data$date,
+                        new_cases = rep(NA, nrow(greece_data)),
+                        new_deaths = rep(NA, nrow(greece_data)))
+greece_ts$new_cases <- cum.to.daily(greece_data$confirmed)
+greece_ts$new_deaths <- cum.to.daily(greece_data$deaths)
+res.times_gr <- which.max(greece_data$confirmed > 0) # when the epidemic begins
+greece_ts <- greece_ts[res.times_gr:nrow(greece_ts), ]
+rownames(greece_ts) <- 1:nrow(greece_ts)
+
+
+## Match the data ##
+
+
+# From - To for every set
+c(data.mob$date[1], data.mob$date[nrow(data.mob)])
+c(greece_ts$date[1], greece_ts$date[nrow(greece_ts)])
+
+# End the data at 31/12/2021
+data.mob <- data.mob[1:which(data.mob$date == "2021-12-31"), ]
+greece_ts <- greece_ts[1:which(greece_ts$date == "2021-12-31"), ]
+
+# Add mobility to the final set
+X <- data.mob[which(data.mob$date == greece_ts$date[1]):nrow(data.mob), -1]
+greece_ts <- cbind(greece_ts, X)
+
+
+## Complete dataset ##
+
+
+rbind(head(greece_ts), tail(greece_ts))
+str(greece_ts)
+
+
+#####
+# Load the model
+
+
+nuts_fit_1.1 <- readRDS("GR_SEIR_vacc_dem.rds")
+posts_1.1 <- extract(nuts_fit_1.1)
+
+
+#####
+# Mobility
+
+
+pop <- 10816286
+tau <- 6
+
+# Serial interval
+set.seed(456)
+mu <- 6.5
+sigma <- 6.5 * 0.62
+sigma2 <- sigma^2
+alpha <- mu^2 / sigma2
+beta <- mu / sigma2
+g <- rgamma(1e7, shape = alpha, rate = beta)
+ECDF <- ecdf(g)
+prob <- NULL
+prob[1] <- ECDF(1.5) - ECDF(0)
+for(s in 2:(nrow(greece_ts)-1)){
+  prob[s] <- ECDF(s+0.5) - ECDF(s-0.5)
+}
+
+loglambda <- log(apply(posts_1.1$lambda, 2, mean))
+covs <- as.matrix(X[1:length(loglambda), ])
+ser.smooth <- function(x){
+  x.smooth <- c(x[1], numeric(length(x)-1))
+  for(t in 2:length(x)){
+    for(i in 1:(t-1)){
+      x.smooth[t] <- x.smooth[t] + prob[t-i] * x[i]
+    }
+  }
+  return(x.smooth)
+}
+covs.ser <- apply(covs, 2, ser.smooth)
+
+# Find the best variable to use
+R2 <- list(R2_covs = NULL, R2_resp = NULL)
+for(i in 1:ncol(covs)){
+  R2$R2_covs[i] <- summary(lm(covs[, i] ~ covs[, -i]))$r.squared
+  R2$R2_resp[i] <- summary(lm(loglambda ~ covs[, i]))$r.squared
+}
+colnames(covs)[which.max(R2$R2_covs + R2$R2_resp)]
+mob <- covs[, which.max(R2$R2_covs + R2$R2_resp)]
+m <- c(mob[1], numeric(length(mob)-1))
+for(t in 2:length(mob)){
+  for(i in 1:(t-1)){
+    m[t] <- m[t] + prob[t-i] * mob[i]
+  }
+}
+
+# # Calculate a R^2 (trast ~ the others)
+# the.regression <- lm(covs[, 4] ~ covs[, -4])
+# ss_reg <- sum((fitted.values(the.regression) - mean(covs[, 4]))^2)
+# ss_tot <- sum((covs[, 4] - mean(covs[, 4]))^2)
+# (r.squared <- ss_reg / ss_tot)
+
+# Standardize
+m.sc <- (m-mean(m)) / sd(m)
+loglambda.sc <- (loglambda-mean(loglambda)) / sd(loglambda)
+
+plot(m, loglambda)
+plot(m.sc)
+points(loglambda.sc, col = 2)
+
+# The data
+dat <- data.frame(x = m, y = loglambda)
+cv.dat <- data.frame(covs.ser, y = loglambda)
+
+
+## Linear regression ##
+
+
+lr.fit <- lm(y ~ x, data = dat)
+lr.fitval <- lr.fit$fitted.values
+summary(lr.fit)
+
+# Fitted line
+plot(m, loglambda)
+abline(lr.fit, col = 2, lwd = 2)
+
+# Response and fitted values
+plot(loglambda, type = "o")
+points(lr.fitval, col = 2, type = "o")
+
+# Response vs fitted values
+plot(lr.fitval, loglambda, main = "Response vs fitted")
+abline(a = 0, b = 1)
+
+# Estimate test error
+(lr.test.error <- repcv(cv.dat, mod.type = "linreg", k = 10, r = 5, seed = 123,
+                        var_sel = TRUE, Y = loglambda, X = covs.ser))
+
+
+## GAM ##
+
+
+gam.fit <- gam(y ~ s(x, bs = "tp"), data = dat)
+summary(gam.fit)
+gam.fitval <- gam.fit$fitted.values
+
+# Fitted line
+plot(m, loglambda)
+points(m, gam.fitval, col = 2)
+
+# Response and fitted values
+plot(loglambda, type = "o")
+points(gam.fitval, col = 2, type = "o")
+
+# Response vs fitted values
+plot(gam.fitval, loglambda, main = "Response vs fitted")
+abline(a = 0, b = 1)
+
+# Estimate test error
+(gam.test.error <- repcv(cv.dat, mod.type = "gam", k = 10, r = 5, seed = 123,
+                         var_sel = TRUE, Y = loglambda, X = covs.ser))
+
+
+## XGBoost ##
+
+
+# Estimate test error
+(xgb.test.error <- repcv(cv.dat, mod.type = "xgboost", k = 10, r = 5, seed = 123,
+                         var_sel = TRUE, Y = loglambda, X = covs.ser))
+
+train_x <- data.matrix(dat[, 1])
+train_y <- dat[, 2]
+xgb_train <- xgb.DMatrix(data = train_x, label = train_y)
+xgbc <- xgb.train(data = xgb_train, max.depth = 1, nrounds = round(xgb.test.error$rounds$ROUNDS))
+xgb.fitval <- predict(xgbc, xgb.DMatrix(data = data.matrix(dat$x), label = dat$y))
+
+# Fitted line
+plot(m, loglambda)
+points(m, xgb.fitval, col = 2)
+
+# Response and fitted values
+plot(loglambda, type = "o")
+points(xgb.fitval, col = 2, type = "o")
+
+# Response vs fitted values
+plot(xgb.fitval, loglambda, main = "Response vs fitted")
+abline(a = 0, b = 1)
+
+
+## LR, GAM and XGBoost ##
+
+
+# Fitted line
+plot(m, loglambda, main = "Fitted line")
+points(m, lr.fitval, col = 4, lwd = 2)
+points(m, gam.fitval, col = 3, lwd = 2)
+points(m, xgb.fitval, col = 2, lwd = 2)
+legend(x = 3, y = -2.4,  legend = c("Data", "LR", "GAM", "XGBOOST"),
+       col = c("black", "blue", "green", "red"), box.lty = 1, cex = 0.8, lty = 1)
+
+# Response and fitted values
+plot(dat$y, type = "o", lwd = 2, main = "Response and fitted values")
+points(lr.fitval, col = 4, type = "o")
+points(gam.fitval, col = 3, type = "o")
+points(xgb.fitval, col = 2, type = "o")
+legend(x = 150, y = -2.4,  legend = c("Data", "LR", "GAM", "XGBOOST"),
+       col = c("black", "blue", "green", "red"), box.lty = 1, cex = 0.8, lty = c(1, 1, 2, 3))
+legend(x = 250, y = -2.4, title = "RMSE",
+       legend = c(round(lr.test.error$rmse$RMSE, 4),
+                  round(gam.test.error$rmse$RMSE, 4),
+                  round(xgb.test.error$rmse$RMSE, 4)),
+       col = c("blue", "green", "red"), box.lty = 1, cex = 0.8, lty = c(1, 2, 3))
+legend(x = 330, y = -2.4, title = "MAE",
+       legend = c(round(lr.test.error$mae$MAE, 4),
+                  round(gam.test.error$mae$MAE, 4),
+                  round(xgb.test.error$mae$MAE, 4)),
+       col = c("blue", "green", "red"), box.lty = 1, cex = 0.8, lty = c(1, 2, 3))
+
+

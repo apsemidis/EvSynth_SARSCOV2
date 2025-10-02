@@ -1,0 +1,899 @@
+# SIR
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2] lambda;          // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2] S;               // susceptible
+  vector<lower=0>[N-2] I;               // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:tau){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I[t] = I[t-1] + tot_cases[t];
+    S[t] = S[t-1] - tot_cases[t];
+  }
+  for(t in 2:tau){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+1):(N-1)){
+    I_t = 0;
+    for(k in (t-tau):(t-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1] = I_t;
+    S[t-1] = S[t-2] - tot_cases[t-1];
+    tot_cases[t] = lambda[t-1] * S[t-1] * I[t-1] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+
+# SIR; dem
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  real A;                            // daily births ( = daily deaths)
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2] lambda;          // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // total cases
+  vector<lower=0>[N-2] S;               // susceptible
+  vector<lower=0>[N-2] I;               // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:tau){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I_t = 0;
+    for(k in 1:t){
+      I_t += tot_cases[k];
+    }
+    I[t] = I_t - A*I[t-1]/pop;
+    S[t] = S[t-1] - tot_cases[t] + A - A*S[t-1]/pop;
+  }
+  for(t in 2:tau){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+1):(N-1)){
+    I_t = 0;
+    for(k in (t-tau):(t-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1] = I_t - A*I[t-2]/pop;
+    S[t-1] = S[t-2] - tot_cases[t-1] + A - A*S[t-2]/pop;
+    tot_cases[t] = lambda[t-1] * S[t-1] * I[t-1] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+
+# SIR; vacc
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  vector[N] vacc;                    // daily vaccinations (1st doses)
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2] lambda;          // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2] S;               // susceptible
+  vector<lower=0>[N-2] I;               // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:tau){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I[t] = I[t-1] + tot_cases[t];
+    S[t] = S[t-1] - tot_cases[t] - vacc[t];
+  }
+  for(t in 2:tau){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+1):(N-1)){
+    I_t = 0;
+    for(k in (t-tau):(t-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1] = I_t;
+    S[t-1] = S[t-2] - tot_cases[t-1] - vacc[t-1];
+    tot_cases[t] = lambda[t-1] * S[t-1] * I[t-1] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+
+# SIR; vacc; dem
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  vector[N] vacc;                    // daily vaccinations (1st doses)
+  real A;                            // daily births ( = daily deaths)
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2] lambda;          // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2] S;               // susceptible
+  vector<lower=0>[N-2] I;               // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:tau){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I_t = 0;
+    for(k in 1:t){
+      I_t += tot_cases[k];
+    }
+    I[t] = I_t - A*I[t-1]/pop;
+    S[t] = S[t-1] - tot_cases[t] - vacc[t] + A - A*S[t-1]/pop;
+  }
+  for(t in 2:tau){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+1):(N-1)){
+    I_t = 0;
+    for(k in (t-tau):(t-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1] = I_t - A*I[t-2]/pop;
+    S[t-1] = S[t-2] - tot_cases[t-1] - vacc[t-1] + A - A*S[t-2]/pop;
+    tot_cases[t] = lambda[t-1] * S[t-1] * I[t-1] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+
+# SEIR
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  int e_per;                         // length of exposed period
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2-e_per] lambda;    // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2-e_per] S;         // susceptible
+  vector<lower=0>[N-2-e_per] I;         // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:(tau+e_per)){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I[t] = I[t-1] + tot_cases[t];
+    S[t] = S[t-1] - tot_cases[t];
+  }
+  for(t in 2:(tau+e_per)){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+e_per+1):(N-1)){
+    I_t = 0;
+    for(k in (t-e_per-tau):(t-e_per-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1-e_per] = I_t;
+    S[t-1-e_per] = S[t-2-e_per] - tot_cases[t-1-e_per];
+    tot_cases[t] = lambda[t-1-e_per] * S[t-1-e_per] * I[t-1-e_per] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+
+# SEIR; dem
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  int e_per;                         // length of exposed period
+  real A;                            // daily births ( = daily deaths)
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2-e_per] lambda;    // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2-e_per] S;         // susceptible
+  vector<lower=0>[N-2-e_per] I;         // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:(tau+e_per)){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I_t = 0;
+    for(k in 1:t){
+      I_t += tot_cases[k];
+    }
+    I[t] = I_t - A*I[t-1]/pop;
+    S[t] = S[t-1] - tot_cases[t] + A - A*S[t-1]/pop;
+  }
+  for(t in 2:(tau+e_per)){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+e_per+1):(N-1)){
+    I_t = 0;
+    for(k in (t-e_per-tau):(t-e_per-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1-e_per] = I_t - A*I[t-2-e_per]/pop;
+    S[t-1-e_per] = S[t-2-e_per] - tot_cases[t-1-e_per] + A - A*S[t-2-e_per]/pop;
+    tot_cases[t] = lambda[t-1-e_per] * S[t-1-e_per] * I[t-1-e_per] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+
+# SEIR; vacc
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  int e_per;                         // length of exposed period
+  vector[N] vacc;                    // daily vaccinations (1st doses)
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2-e_per] lambda;    // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2-e_per] S;         // susceptible
+  vector<lower=0>[N-2-e_per] I;         // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:(tau+e_per)){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I[t] = I[t-1] + tot_cases[t];
+    S[t] = S[t-1] - tot_cases[t] - vacc[t];
+  }
+  for(t in 2:(tau+e_per)){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+e_per+1):(N-1)){
+    I_t = 0;
+    for(k in (t-e_per-tau):(t-e_per-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1-e_per] = I_t;
+    S[t-1-e_per] = S[t-2-e_per] - tot_cases[t-1-e_per] - vacc[t-1-e_per];
+    tot_cases[t] = lambda[t-1-e_per] * S[t-1-e_per] * I[t-1-e_per] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
+
+# SEIR; vacc; dem
+NegBin_1 <- '
+data {
+  int N;                             // number of observations
+  int pop;                           // population
+  int deaths[N];                     // daily deaths
+  int br;                            // first day - changepoints - last day
+  int breaks[br];                    // indices for ifr changepoints
+  int ch_p[br-2];                    // time of changepoint
+  vector[br-1] ifr_m;                // ifr mean values
+  vector[N-1] p_d;                   // probabilities of death
+  int l_n;                           // how many weeks for lambda
+  int u[l_n];                        // indices where lambda changes
+  int tau;                           // infectious period
+  int e_per;                         // length of exposed period
+  vector[N] vacc;                    // daily vaccinations (1st doses)
+  real A;                            // daily births ( = daily deaths)
+}
+
+parameters {
+  real<lower=0> psi;                    // overdispersion for deaths
+  vector<lower=0>[l_n-1] lambdas;       // infection rate per constant interval
+  vector<lower=0,upper=1>[br-1] ifrs;   // ifr per constant interval
+  real<lower=0> tot_cases1;             // first total cases
+  real<lower=0> theta_d1;               // first fitted deaths
+}
+
+transformed parameters {
+  vector<lower=0>[N] theta_d;           // mean new deaths
+  vector<lower=0>[N-2-e_per] lambda;    // infection rate
+  vector<lower=0,upper=1>[N] ifr;       // ifr
+  vector<lower=0>[N-1] tot_cases;       // estimated new cases
+  vector<lower=0>[N-2-e_per] S;         // susceptible
+  vector<lower=0>[N-2-e_per] I;         // infectious
+  real<lower=0> sum_d;
+  real<lower=0> I_t;                    // infectious at time t-1-e_per
+  
+  for(j in 1:(l_n-1)){
+    for(t in u[j]:(u[j+1]-1)){
+      lambda[t] = lambdas[j];
+    }
+  }
+  for(j in 1:(br-1)){
+    for(t in breaks[j]:(breaks[j+1]-1)){
+      ifr[t] = ifrs[j];
+    }
+  }
+  ifr[1] = ifrs[1];
+  ifr[N] = ifr[N-1];
+  theta_d[1] = theta_d1;
+  for(t in 1:(tau+e_per)){
+    tot_cases[t] = tot_cases1;
+  }
+  S[1] = pop - tot_cases[1];
+  I[1] = tot_cases[1];
+  for(t in 2:(tau-1)){
+    I_t = 0;
+    for(k in 1:t){
+      I_t += tot_cases[k];
+    }
+    I[t] = I_t - A*I[t-1]/pop;
+    S[t] = S[t-1] - tot_cases[t] - vacc[t] + A - A*S[t-1]/pop;
+  }
+  for(t in 2:(tau+e_per)){
+    sum_d = 0;
+      for(j in 1:(t-1)){
+        sum_d += p_d[t-j]*tot_cases[j];
+      }
+      theta_d[t] = ifr[t] * sum_d;
+  }
+  for(t in (tau+e_per+1):(N-1)){
+    I_t = 0;
+    for(k in (t-e_per-tau):(t-e_per-1)){
+      I_t += tot_cases[k];
+    }
+    I[t-1-e_per] = I_t - A*I[t-2-e_per]/pop;
+    S[t-1-e_per] = S[t-2-e_per] - tot_cases[t-1-e_per] - vacc[t-1-e_per] + A - A*S[t-2-e_per]/pop;
+    tot_cases[t] = lambda[t-1-e_per] * S[t-1-e_per] * I[t-1-e_per] / pop;
+    sum_d = 0;
+    for(j in 1:(t-1)){
+      sum_d += p_d[t-j]*tot_cases[j];
+    }
+    theta_d[t] = ifr[t] * sum_d;
+  }
+  sum_d = 0;
+  for(i in 1:(N-1)){
+    sum_d += p_d[N-i]*tot_cases[i];
+  }
+  theta_d[N] = ifr[N] * sum_d;
+}
+
+model {
+  for(i in 1:(l_n-1)){
+    target += lognormal_lpdf(lambdas[i] | 0, 1);
+  }
+  for(i in 1:(br-1)){
+    target += normal_lpdf(ifrs[i] | ifr_m[i], 0.0001);
+  }
+  target += gamma_lpdf(psi | 2, 0.125);             // mean = 2 / 0.125 (shape,rate)
+  target += gamma_lpdf(tot_cases1 | 6, 0.0625);     // mean = 6 / 0.0625 (shape,rate)
+  target += exponential_lpdf(theta_d1 | 1);         // mean = 1 / 1
+  
+  for(t in 1:N){
+    target += neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+
+generated quantities {
+  vector[N] log_lik;
+  
+  for(t in 1:N){
+    log_lik[t] = neg_binomial_2_lpmf(deaths[t] | theta_d[t], psi);
+  }
+}
+'
